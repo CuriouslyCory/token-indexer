@@ -174,73 +174,48 @@ export class ContractService {
       return false;
     }
 
-    const client = this.getChainClient(chainId);
-    if (!client) {
-      log.error(`Failed to get client for chain ${chainId}`);
-      return false;
-    }
-
     log.info(
       `Revalidating tokens for contract ${contractAddress} on chain ${chainId}`
     );
 
-    // Get all tokens for this contract from the database
-    const tokens = await this.app.prisma.nftToken.findMany({
+    let success = false;
+
+    const contract = await this.app.prisma.nft.findUnique({
       where: {
-        chainId,
-        contractAddress,
-      },
-      select: {
-        tokenId: true,
-        ownerAddress: true,
+        chainId_contractAddress: {
+          chainId,
+          contractAddress,
+        },
       },
     });
 
-    if (tokens.length === 0) {
-      log.info(
-        `No tokens found for contract ${contractAddress} on chain ${chainId}`
+    if (!contract) {
+      log.error(
+        `NFT not found for contract ${contractAddress} on chain ${chainId}`
       );
       return false;
     }
-
-    let success = false;
 
     // Try different methods based on token type
     if (tokenType === TokenType.ERC721) {
       // Try ownerOf method first
       success = await this.revalidateWithOwnerOf(
         chainId,
-        client,
         contractAddress,
-        tokens.filter((token) => token.ownerAddress !== null) as {
-          tokenId: string;
-          ownerAddress: string;
-        }[]
+        parseInt(contract.supply ?? "0")
       );
 
       // If ownerOf failed, try tokenOfOwnerByIndex
       if (!success) {
-        success = await this.revalidateWithTokenOfOwnerByIndex(
+        success = await this.revalidateWithTokenByIndex(
           chainId,
-          client,
           contractAddress,
-          tokens.filter((token) => token.ownerAddress !== null) as {
-            tokenId: string;
-            ownerAddress: string;
-          }[]
+          parseInt(contract.supply ?? "0")
         );
       }
     } else if (tokenType === TokenType.ERC1155) {
-      // For ERC1155, we can only check balanceOf
-      success = await this.revalidateWithBalanceOf(
-        chainId,
-        client,
-        contractAddress,
-        tokens.filter((token) => token.ownerAddress !== null) as {
-          tokenId: string;
-          ownerAddress: string;
-        }[]
-      );
+      // erc1155 doesn't have a way to check token ownership without addresses
+      success = false;
     }
 
     return success;
@@ -251,12 +226,17 @@ export class ContractService {
    */
   private async revalidateWithOwnerOf(
     chainId: number,
-    client: PublicClient,
     contractAddress: Address,
-    tokens: { tokenId: string; ownerAddress: string }[]
+    supply: number
   ): Promise<boolean> {
     try {
       log.info(`Revalidating with ownerOf for ${contractAddress}`);
+
+      const client = this.getChainClient(chainId);
+      if (!client) {
+        log.error(`Failed to get client for chain ${chainId}`);
+        return false;
+      }
 
       const contract = getContract({
         address: contractAddress,
@@ -269,32 +249,28 @@ export class ContractService {
       let successCount = 0;
       let failureCount = 0;
 
-      for (let i = 0; i < tokens.length; i += batchSize) {
-        const batch = tokens.slice(i, i + batchSize);
+      for (let i = 0; i < supply; i += batchSize) {
         let batchSuccess = false;
 
-        for (const token of batch) {
+        for (let tokenId = i; tokenId < i + batchSize; tokenId++) {
           try {
             // Call ownerOf for each token
-            const owner = await contract.read.ownerOf([BigInt(token.tokenId)]);
+            const owner = await contract.read.ownerOf([BigInt(tokenId)]);
 
             // If the owner has changed, update the database
-            if (owner.toLowerCase() !== token.ownerAddress.toLowerCase()) {
-              await this.updateTokenOwner(
-                chainId,
-                contractAddress,
-                token.tokenId,
-                owner.toLowerCase() as Address
-              );
-            }
+
+            await this.updateTokenOwner(
+              chainId,
+              contractAddress,
+              tokenId.toString(),
+              owner.toLowerCase() as Address
+            );
 
             batchSuccess = true;
             successCount++;
           } catch (error) {
             failureCount++;
-            log.warn(
-              `Failed to check ownerOf for token ${token.tokenId}: ${error}`
-            );
+            log.warn(`Failed to check ownerOf for token ${tokenId}: ${error}`);
           }
         }
 
@@ -328,14 +304,19 @@ export class ContractService {
   /**
    * Revalidate tokens using the tokenOfOwnerByIndex method (ERC721)
    */
-  private async revalidateWithTokenOfOwnerByIndex(
+  private async revalidateWithTokenByIndex(
     chainId: number,
-    client: PublicClient,
     contractAddress: Address,
-    tokens: { tokenId: string; ownerAddress: string }[]
+    supply: number
   ): Promise<boolean> {
     try {
       log.info(`Revalidating with tokenOfOwnerByIndex for ${contractAddress}`);
+
+      const client = this.getChainClient(chainId);
+      if (!client) {
+        log.error(`Failed to get client for chain ${chainId}`);
+        return false;
+      }
 
       const contract = getContract({
         address: contractAddress,
@@ -343,45 +324,48 @@ export class ContractService {
         client,
       });
 
-      // Get unique owner addresses
-      const owners = [...new Set(tokens.map((token) => token.ownerAddress))];
-
       // Process owners in batches of 10
       const batchSize = 10;
       let successCount = 0;
       let failureCount = 0;
 
-      for (let i = 0; i < owners.length; i += batchSize) {
-        const batch = owners.slice(i, i + batchSize);
+      for (let i = 0; i < supply; i += batchSize) {
         let batchSuccess = false;
 
-        for (const owner of batch) {
+        for (let tokenId = i; tokenId < i + batchSize; tokenId++) {
           try {
             // Try to get the first token for this owner
-            const tokenId = await contract.read.tokenOfOwnerByIndex([
-              owner as Address,
-              BigInt(0),
-            ]);
+            const owner = await contract.read.ownerOf([BigInt(tokenId)]);
 
             // If we got a token, the owner is valid
             batchSuccess = true;
             successCount++;
 
             // Check if this token is in our database
-            const token = tokens.find((t) => BigInt(t.tokenId) === tokenId);
+            const token = await this.app?.prisma.nftToken.findUnique({
+              where: {
+                chainId_contractAddress_tokenId: {
+                  chainId,
+                  contractAddress,
+                  tokenId: tokenId.toString(),
+                },
+              },
+            });
             if (!token) {
               // This is a new token, add it to the database
-              await this.addNewToken(
-                chainId,
-                contractAddress,
-                tokenId.toString(),
-                owner as Address
-              );
+              await this.app?.prisma.nftToken.create({
+                data: {
+                  chainId,
+                  contractAddress,
+                  tokenId: tokenId.toString(),
+                  ownerAddress: owner as Address,
+                },
+              });
             }
           } catch (error) {
             failureCount++;
             log.warn(
-              `Failed to check tokenOfOwnerByIndex for owner ${owner}: ${error}`
+              `Failed to check tokenOfOwnerByIndex for token ${tokenId}: ${error}`
             );
           }
         }
@@ -414,88 +398,6 @@ export class ContractService {
   }
 
   /**
-   * Revalidate tokens using the balanceOf method (ERC1155)
-   */
-  private async revalidateWithBalanceOf(
-    chainId: number,
-    client: PublicClient,
-    contractAddress: Address,
-    tokens: { tokenId: string; ownerAddress: string }[]
-  ): Promise<boolean> {
-    try {
-      log.info(`Revalidating with balanceOf for ${contractAddress}`);
-
-      const contract = getContract({
-        address: contractAddress,
-        abi: erc1155Abi,
-        client,
-      });
-
-      // Process tokens in batches of 10
-      const batchSize = 10;
-      let successCount = 0;
-      let failureCount = 0;
-
-      for (let i = 0; i < tokens.length; i += batchSize) {
-        const batch = tokens.slice(i, i + batchSize);
-        let batchSuccess = false;
-
-        for (const token of batch) {
-          try {
-            // Call balanceOf for each token
-            const balance = await contract.read.balanceOf([
-              token.ownerAddress as Address,
-              BigInt(token.tokenId),
-            ]);
-
-            // If the balance is 0, the owner no longer has this token
-            if (balance === BigInt(0)) {
-              // We don't know who the new owner is, so we can only mark it as unknown
-              await this.markTokenAsUnknownOwner(
-                chainId,
-                contractAddress,
-                token.tokenId
-              );
-            }
-
-            batchSuccess = true;
-            successCount++;
-          } catch (error) {
-            failureCount++;
-            log.warn(
-              `Failed to check balanceOf for token ${token.tokenId}: ${error}`
-            );
-          }
-        }
-
-        // If the first batch completely fails, consider it a failure
-        if (i === 0 && !batchSuccess) {
-          log.error(
-            `First batch of balanceOf checks failed for ${contractAddress}`
-          );
-          return false;
-        }
-
-        // If a batch completely fails, consider the method exhausted
-        if (!batchSuccess) {
-          log.info(
-            `Batch ${i / batchSize} failed completely, stopping balanceOf checks`
-          );
-          break;
-        }
-      }
-
-      log.info(
-        `balanceOf revalidation complete: ${successCount} successes, ${failureCount} failures`
-      );
-      return successCount > 0;
-    } catch (error) {
-      log.error(`Error in revalidateWithBalanceOf: ${error}`);
-      return false;
-    }
-  }
-
-  /**
    * Update the owner of a token in the database
    */
   private async updateTokenOwner(
@@ -507,7 +409,7 @@ export class ContractService {
     if (!this.app?.prisma) return;
 
     try {
-      await this.app.prisma.nftToken.update({
+      await this.app.prisma.nftToken.upsert({
         where: {
           chainId_contractAddress_tokenId: {
             chainId,
@@ -515,9 +417,15 @@ export class ContractService {
             tokenId,
           },
         },
-        data: {
+        update: {
           ownerAddress: newOwner,
           updatedAt: new Date(),
+        },
+        create: {
+          chainId,
+          contractAddress,
+          tokenId,
+          ownerAddress: newOwner,
         },
       });
       log.info(`Updated owner of token ${tokenId} to ${newOwner}`);

@@ -198,7 +198,6 @@ export function registerNftRoutes(app: FastifyInstance) {
         properties: {
           chain: { type: "string" },
           address: { type: "string" },
-          tokenId: { type: "string" },
         },
       },
       response: {
