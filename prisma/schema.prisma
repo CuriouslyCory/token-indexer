@@ -2,7 +2,7 @@
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
 generator client {
-  provider        = "sqlite"
+  provider        = "prisma-client-js"
   previewFeatures = ["typedSql"]
 }
 
@@ -15,91 +15,52 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum DocumentType {
-  EXECUTIVE_ORDER
-  FACT_SHEET
-  REMARKS
-  LEGISLATION
-  OTHER
+// Enum for NFT types
+enum NftType {
+  ERC721
+  ERC1155
 }
 
-model Document {
-  id        Int      @id @default(autoincrement())
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// New model for NFT collections
+model Nft {
+  id              Int      @id @default(autoincrement())
+  chainId         Int
+  contractAddress String
+  ownerAddress    String?
+  supply          String? // Using String to handle large numbers
+  symbol          String?
+  name            String
+  logoUri         String?
+  bannerUri       String?
+  description     String?
+  type            NftType
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now()) @updatedAt
+  watching        Boolean  @default(false)
 
-  documentArtifact    DocumentArtifact[]
-  title               String
-  originalDocumentUrl String                   @unique
-  shortSummary        String?
-  slug                String                   @unique @default(cuid())
-  dateSigned          DateTime
-  signer              String
-  riskScore           Int?
-  search_vector       Unsupported("tsvector")?
-  type                DocumentType             @default(OTHER)
-
-  @@index([title])
-  @@index([search_vector], type: Gin)
+  // Composite unique constraint to ensure uniqueness of NFT collections per chain
+  @@unique([chainId, contractAddress])
+  // Index for faster queries
+  @@index([chainId])
+  @@index([ownerAddress])
+  @@index([type])
 }
 
-model DocumentArtifact {
-  id Int @id @default(autoincrement())
+// Model for NFT tokens within a collection (for ERC1155)
+model NftToken {
+  id              Int      @id @default(autoincrement())
+  chainId         Int
+  contractAddress String
+  tokenId         String // Using String to handle large token IDs
+  supply          String? // Using String to handle large numbers
+  ownerAddress    String?
+  metadata        String? // JSON metadata
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  title     String
-  content   String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  documentId Int
-  document   Document @relation(fields: [documentId], references: [id])
-
-  @@unique([documentId, title])
-}
-
-// Necessary for Next auth
-model Account {
-  id                       String  @id @default(cuid())
-  userId                   String
-  type                     String
-  provider                 String
-  providerAccountId        String
-  refresh_token            String? // @db.Text
-  access_token             String? // @db.Text
-  expires_at               Int?
-  token_type               String?
-  scope                    String?
-  id_token                 String? // @db.Text
-  session_state            String?
-  user                     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  refresh_token_expires_in Int?
-
-  @@unique([provider, providerAccountId])
-}
-
-model Session {
-  id           String   @id @default(cuid())
-  sessionToken String   @unique
-  userId       String
-  expires      DateTime
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
-
-model User {
-  id            String    @id @default(cuid())
-  name          String?
-  email         String?   @unique
-  emailVerified DateTime?
-  image         String?
-  isAdmin       Boolean   @default(false)
-  accounts      Account[]
-  sessions      Session[]
-}
-
-model VerificationToken {
-  identifier String
-  token      String   @unique
-  expires    DateTime
-
-  @@unique([identifier, token])
+  // Composite unique constraint to ensure uniqueness of NFT tokens
+  @@unique([chainId, contractAddress, tokenId])
+  // Index for faster queries
+  @@index([chainId, contractAddress])
+  @@index([ownerAddress])
 }

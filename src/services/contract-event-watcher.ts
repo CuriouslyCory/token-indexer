@@ -1,6 +1,6 @@
 import { FastifyInstance } from "fastify";
 import log from "electron-log";
-import { loadEnv } from "~/utils/loadEnv";
+import { loadEnv, nftTypeToTokenType, tokenTypeToNftType } from "~/utils";
 import { z } from "zod";
 import {
   createPublicClient,
@@ -23,6 +23,8 @@ import {
 import { erc721Abi } from "~/constants/abi/erc721";
 import { erc20Abi } from "~/constants/abi/erc20";
 import { erc1155Abi } from "~/constants/abi/erc1155";
+import SuperJSON from "superjson";
+import { NftType } from "@prisma/client";
 
 loadEnv();
 
@@ -35,7 +37,7 @@ export enum TokenType {
 
 // Schema for contract watch parameters
 export const ContractWatchParamsSchema = z.object({
-  chain: z.string(),
+  chain: z.coerce.number(),
   type: z.nativeEnum(TokenType),
   address: z.string(),
 });
@@ -52,7 +54,7 @@ type EventType =
 
 // Structure to hold event watchers by chain and event type
 interface ChainEventWatchers {
-  [chainId: string]: {
+  [chainId: number]: {
     client: PublicClient;
     eventWatchers: {
       [eventType in EventType]?: {
@@ -69,23 +71,13 @@ export class ContractEventWatcherService {
   private chainEventWatchers: ChainEventWatchers = {};
 
   // Map of supported chains
-  private readonly chains: Record<string, Chain> = {
-    mainnet,
-    sepolia,
-    base,
-    optimism,
-    arbitrum,
-    polygon,
-  };
-
-  // Map chain names to chain IDs
-  private readonly chainIds: Record<string, number> = {
-    mainnet: 1,
-    sepolia: 11155111,
-    base: 8453,
-    optimism: 10,
-    arbitrum: 42161,
-    polygon: 137,
+  private readonly chains: Record<number, Chain> = {
+    1: mainnet,
+    11155111: sepolia,
+    8453: base,
+    10: optimism,
+    42161: arbitrum,
+    137: polygon,
   };
 
   private constructor() {}
@@ -104,24 +96,21 @@ export class ContractEventWatcherService {
   /**
    * Get or create a client for a specific chain
    */
-  private getOrCreateChainClient(chainName: string): PublicClient | null {
-    const chainId = this.chainIds[chainName.toLowerCase()];
+  private getOrCreateChainClient(chainId: number): PublicClient | null {
     if (!chainId) {
-      log.error(`Unsupported chain: ${chainName}`);
+      log.error(`chainId is required: ${chainId}`);
       return null;
     }
 
-    const chainIdStr = chainId.toString();
-
     // If we already have a client for this chain, return it
-    if (this.chainEventWatchers[chainIdStr]?.client) {
-      return this.chainEventWatchers[chainIdStr].client;
+    if (this.chainEventWatchers[chainId]?.client) {
+      return this.chainEventWatchers[chainId].client;
     }
 
     // Otherwise, create a new client
-    const chain = this.chains[chainName.toLowerCase()];
+    const chain = this.chains[chainId];
     if (!chain) {
-      log.error(`Unsupported chain: ${chainName}`);
+      log.error(`Unsupported chain: ${chainId}`);
       return null;
     }
 
@@ -131,13 +120,13 @@ export class ContractEventWatcherService {
     });
 
     // Initialize the chain watcher structure
-    if (!this.chainEventWatchers[chainIdStr]) {
-      this.chainEventWatchers[chainIdStr] = {
+    if (!this.chainEventWatchers[chainId]) {
+      this.chainEventWatchers[chainId] = {
         client,
         eventWatchers: {},
       };
     } else {
-      this.chainEventWatchers[chainIdStr].client = client;
+      this.chainEventWatchers[chainId].client = client;
     }
 
     return client;
@@ -157,8 +146,7 @@ export class ContractEventWatcherService {
         return false;
       }
 
-      const chainId =
-        this.chainIds[validatedParams.chain.toLowerCase()].toString();
+      const chainId = validatedParams.chain;
       const address = validatedParams.address as Address;
 
       // Add the contract to the appropriate event watchers based on token type
@@ -169,6 +157,7 @@ export class ContractEventWatcherService {
             "erc721Transfer",
             address
           );
+          await this.upsertNft(chainId, address, TokenType.ERC721);
           break;
 
         case TokenType.ERC20:
@@ -191,6 +180,7 @@ export class ContractEventWatcherService {
             address
           );
           await this.addContractToEventWatcher(chainId, "erc1155URI", address);
+          await this.upsertNft(chainId, address, TokenType.ERC1155);
           break;
 
         default:
@@ -208,11 +198,48 @@ export class ContractEventWatcherService {
     }
   }
 
+  private async upsertNft(
+    chainId: number,
+    address: Address,
+    tokenType: TokenType
+  ): Promise<void> {
+    // Upsert the NFT record in the database
+    if (this.app?.prisma) {
+      try {
+        // For simplicity, we'll just use a default name and not try to read from the contract
+        // This avoids the complex type issues with the ABI
+        await this.app.prisma.nft.upsert({
+          where: {
+            chainId_contractAddress: {
+              chainId,
+              contractAddress: address,
+            },
+          },
+          update: {
+            watching: true,
+          },
+          create: {
+            chainId,
+            contractAddress: address,
+            name: `ERC721 NFT (${address.slice(0, 6)}...)`,
+            type: tokenTypeToNftType(tokenType)!,
+            watching: true,
+          },
+        });
+        log.info(
+          `Upserted ERC721 NFT record for ${address} on chain ${chainId}`
+        );
+      } catch (error) {
+        log.error(`Error upserting NFT record: ${error}`);
+      }
+    }
+  }
+
   /**
    * Add a contract address to an event watcher and set up the watcher if needed
    */
   private async addContractToEventWatcher(
-    chainId: string,
+    chainId: number,
     eventType: EventType,
     address: Address
   ): Promise<void> {
@@ -241,7 +268,7 @@ export class ContractEventWatcherService {
    * Set up an event watcher for a specific chain and event type
    */
   private async setupEventWatcher(
-    chainId: string,
+    chainId: number,
     eventType: EventType
   ): Promise<void> {
     const client = this.chainEventWatchers[chainId].client;
@@ -313,7 +340,7 @@ export class ContractEventWatcherService {
   /**
    * Handle ERC20 Transfer logs
    */
-  private handleErc20TransferLogs(chainId: string, logs: Log[]): void {
+  private handleErc20TransferLogs(chainId: number, logs: Log[]): void {
     for (const logItem of logs) {
       try {
         const args = {
@@ -326,15 +353,17 @@ export class ContractEventWatcherService {
           amount: logItem.data ? BigInt(logItem.data) : undefined,
         };
 
-        log.info({
-          chainId,
-          contractAddress: logItem.address,
-          tokenType: TokenType.ERC20,
-          eventName: "Transfer",
-          blockNumber: logItem.blockNumber,
-          transactionHash: logItem.transactionHash,
-          args,
-        });
+        log.info(
+          SuperJSON.stringify({
+            chainId,
+            contractAddress: logItem.address,
+            tokenType: TokenType.ERC20,
+            eventName: "Transfer",
+            blockNumber: logItem.blockNumber,
+            transactionHash: logItem.transactionHash,
+            args,
+          })
+        );
       } catch (error) {
         log.error(`Error processing ERC20 Transfer log:`, error);
       }
@@ -344,7 +373,7 @@ export class ContractEventWatcherService {
   /**
    * Handle ERC721 Transfer logs
    */
-  private handleErc721TransferLogs(chainId: string, logs: Log[]): void {
+  private handleErc721TransferLogs(chainId: number, logs: Log[]): void {
     for (const logItem of logs) {
       try {
         const args = {
@@ -359,15 +388,39 @@ export class ContractEventWatcherService {
             : undefined,
         };
 
-        log.info({
-          chainId,
-          contractAddress: logItem.address,
-          tokenType: TokenType.ERC721,
-          eventName: "Transfer",
-          blockNumber: logItem.blockNumber,
-          transactionHash: logItem.transactionHash,
-          args,
-        });
+        // Upsert the NFT token in the database when a transfer occurs
+        if (this.app?.prisma && args.to && args.tokenId) {
+          // Use a self-executing async function to handle the database operation
+          (async () => {
+            try {
+              await this.app!.prisma.nftToken.upsert({
+                where: {
+                  chainId_contractAddress_tokenId: {
+                    chainId,
+                    contractAddress: logItem.address,
+                    tokenId: args.tokenId!.toString(),
+                  },
+                },
+                update: {
+                  ownerAddress: args.to,
+                  updatedAt: new Date(),
+                },
+                create: {
+                  chainId,
+                  contractAddress: logItem.address,
+                  tokenId: args.tokenId!.toString(),
+                  ownerAddress: args.to,
+                  supply: "1", // ERC721 tokens always have a supply of 1
+                },
+              });
+              log.info(
+                `Upserted ERC721 token ${args.tokenId} for ${logItem.address} on chain ${chainId} with owner ${args.to}`
+              );
+            } catch (error) {
+              log.error(`Error upserting NFT token: ${error}`);
+            }
+          })();
+        }
       } catch (error) {
         log.error(`Error processing ERC721 Transfer log:`, error);
       }
@@ -377,7 +430,7 @@ export class ContractEventWatcherService {
   /**
    * Handle ERC1155 TransferSingle logs
    */
-  private handleErc1155TransferSingleLogs(chainId: string, logs: Log[]): void {
+  private handleErc1155TransferSingleLogs(chainId: number, logs: Log[]): void {
     for (const logItem of logs) {
       try {
         const args = {
@@ -400,15 +453,40 @@ export class ContractEventWatcherService {
               : undefined,
         };
 
-        log.info({
-          chainId,
-          contractAddress: logItem.address,
-          tokenType: TokenType.ERC1155,
-          eventName: "TransferSingle",
-          blockNumber: logItem.blockNumber,
-          transactionHash: logItem.transactionHash,
-          args,
-        });
+        // Upsert the NFT token in the database when a transfer occurs
+        if (this.app?.prisma && args.to && args.id && args.value) {
+          // Use a self-executing async function to handle the database operation
+          (async () => {
+            try {
+              await this.app!.prisma.nftToken.upsert({
+                where: {
+                  chainId_contractAddress_tokenId: {
+                    chainId,
+                    contractAddress: logItem.address,
+                    tokenId: args.id!.toString(),
+                  },
+                },
+                update: {
+                  ownerAddress: args.to,
+                  supply: args.value!.toString(),
+                  updatedAt: new Date(),
+                },
+                create: {
+                  chainId,
+                  contractAddress: logItem.address,
+                  tokenId: args.id!.toString(),
+                  ownerAddress: args.to,
+                  supply: args.value!.toString(),
+                },
+              });
+              log.info(
+                `Upserted ERC1155 token ${args.id} for ${logItem.address} on chain ${chainId} with owner ${args.to} and supply ${args.value}`
+              );
+            } catch (error) {
+              log.error(`Error upserting NFT token: ${error}`);
+            }
+          })();
+        }
       } catch (error) {
         log.error(`Error processing ERC1155 TransferSingle log:`, error);
       }
@@ -418,7 +496,7 @@ export class ContractEventWatcherService {
   /**
    * Handle ERC1155 TransferBatch logs
    */
-  private handleErc1155TransferBatchLogs(chainId: string, logs: Log[]): void {
+  private handleErc1155TransferBatchLogs(chainId: number, logs: Log[]): void {
     for (const logItem of logs) {
       try {
         const args = {
@@ -434,15 +512,67 @@ export class ContractEventWatcherService {
           data: logItem.data ?? "0x",
         };
 
-        log.info({
-          chainId,
-          contractAddress: logItem.address,
-          tokenType: TokenType.ERC1155,
-          eventName: "TransferBatch",
-          blockNumber: logItem.blockNumber,
-          transactionHash: logItem.transactionHash,
-          args,
-        });
+        // For TransferBatch, we need to decode the data to get the token IDs and values
+        if (this.app?.prisma && args.to && args.data && args.data.length > 2) {
+          // Use a self-executing async function to handle the database operation
+          (async () => {
+            try {
+              // Remove the 0x prefix
+              const data = args.data.slice(2);
+
+              // The first 64 characters represent the offset to the ids array
+              const idsOffset = parseInt(data.slice(0, 64), 16);
+
+              // The next 64 characters represent the offset to the values array
+              const valuesOffset = parseInt(data.slice(64, 128), 16);
+
+              // Get the length of the ids array (32 bytes after the offset)
+              const idsLengthHex = data.slice(
+                idsOffset * 2,
+                (idsOffset + 32) * 2
+              );
+              const idsLength = parseInt(idsLengthHex, 16);
+
+              // Get the length of the values array (32 bytes after the offset)
+              const valuesLengthHex = data.slice(
+                valuesOffset * 2,
+                (valuesOffset + 32) * 2
+              );
+              const valuesLength = parseInt(valuesLengthHex, 16);
+
+              // Ensure the arrays have the same length
+              if (idsLength === valuesLength) {
+                // Extract the ids and values
+                for (let i = 0; i < idsLength; i++) {
+                  const idHex = data.slice(
+                    (idsOffset + 32 + i * 32) * 2,
+                    (idsOffset + 32 + (i + 1) * 32) * 2
+                  );
+                  const valueHex = data.slice(
+                    (valuesOffset + 32 + i * 32) * 2,
+                    (valuesOffset + 32 + (i + 1) * 32) * 2
+                  );
+
+                  const id = BigInt(`0x${idHex}`);
+                  const value = BigInt(`0x${valueHex}`);
+
+                  // Process each token in a separate async function to avoid await issues
+                  this.processErc1155Token(
+                    chainId,
+                    logItem.address,
+                    id.toString(),
+                    value.toString(),
+                    args.to
+                  );
+                }
+              }
+            } catch (error) {
+              log.error(
+                `Error processing ERC1155 TransferBatch data: ${error}`
+              );
+            }
+          })();
+        }
       } catch (error) {
         log.error(`Error processing ERC1155 TransferBatch log:`, error);
       }
@@ -450,9 +580,51 @@ export class ContractEventWatcherService {
   }
 
   /**
+   * Process an ERC1155 token for database update
+   */
+  private async processErc1155Token(
+    chainId: number,
+    contractAddress: string,
+    tokenId: string,
+    supply: string,
+    ownerAddress: string | undefined
+  ): Promise<void> {
+    if (!this.app?.prisma || !ownerAddress) return;
+
+    try {
+      await this.app.prisma.nftToken.upsert({
+        where: {
+          chainId_contractAddress_tokenId: {
+            chainId,
+            contractAddress,
+            tokenId,
+          },
+        },
+        update: {
+          ownerAddress,
+          supply,
+          updatedAt: new Date(),
+        },
+        create: {
+          chainId,
+          contractAddress,
+          tokenId,
+          ownerAddress,
+          supply,
+        },
+      });
+      log.info(
+        `Upserted ERC1155 token ${tokenId} for ${contractAddress} on chain ${chainId} with owner ${ownerAddress} and supply ${supply}`
+      );
+    } catch (error) {
+      log.error(`Error upserting NFT token: ${error}`);
+    }
+  }
+
+  /**
    * Handle ERC1155 URI logs
    */
-  private handleErc1155URILogs(chainId: string, logs: Log[]): void {
+  private handleErc1155URILogs(chainId: number, logs: Log[]): void {
     for (const logItem of logs) {
       try {
         const args = {
@@ -462,15 +634,17 @@ export class ContractEventWatcherService {
           value: logItem.data ?? "0x",
         };
 
-        log.info({
-          chainId,
-          contractAddress: logItem.address,
-          tokenType: TokenType.ERC1155,
-          eventName: "URI",
-          blockNumber: logItem.blockNumber,
-          transactionHash: logItem.transactionHash,
-          args,
-        });
+        log.info(
+          SuperJSON.stringify({
+            chainId,
+            contractAddress: logItem.address,
+            tokenType: TokenType.ERC1155,
+            eventName: "URI",
+            blockNumber: logItem.blockNumber,
+            transactionHash: logItem.transactionHash,
+            args,
+          })
+        );
       } catch (error) {
         log.error(`Error processing ERC1155 URI log:`, error);
       }
@@ -480,11 +654,10 @@ export class ContractEventWatcherService {
   /**
    * Remove a contract from being watched
    */
-  public stopWatching(address: string, chainName: string): boolean {
+  public stopWatching(address: string, chainId: number): boolean {
     try {
-      const chainId = this.chainIds[chainName.toLowerCase()]?.toString();
       if (!chainId || !this.chainEventWatchers[chainId]) {
-        log.error(`Chain not found: ${chainName}`);
+        log.error(`Chain not found: ${chainId}`);
         return false;
       }
 
@@ -514,7 +687,30 @@ export class ContractEventWatcherService {
       }
 
       if (removed) {
-        log.info(`Stopped watching contract at ${address} on ${chainName}`);
+        log.info(`Stopped watching contract at ${address} on ${chainId}`);
+
+        // Update the watching status in the database
+        if (this.app?.prisma) {
+          // Use a self-executing async function to handle the database operation
+          (async () => {
+            try {
+              await this.app!.prisma.nft.updateMany({
+                where: {
+                  chainId,
+                  contractAddress: normalizedAddress,
+                },
+                data: {
+                  watching: false,
+                },
+              });
+              log.info(
+                `Updated watching status to false for ${address} on chain ${chainId}`
+              );
+            } catch (error) {
+              log.error(`Error updating NFT watching status: ${error}`);
+            }
+          })();
+        }
 
         // If there are no more event watchers for this chain, clean up
         if (
@@ -527,10 +723,10 @@ export class ContractEventWatcherService {
         return true;
       }
 
-      log.warn(`Contract at ${address} on ${chainName} was not being watched`);
+      log.warn(`Contract at ${address} on ${chainId} was not being watched`);
       return false;
     } catch (error) {
-      log.error(`Error stopping watch for ${address} on ${chainName}:`, error);
+      log.error(`Error stopping watch for ${address} on ${chainId}:`, error);
       return false;
     }
   }
@@ -540,6 +736,56 @@ export class ContractEventWatcherService {
    */
   public async start(): Promise<void> {
     try {
+      // Check if we have access to the database
+      if (this.app?.prisma) {
+        // Query the Nfts table for contracts with watching = true
+        const watchingNfts = await this.app.prisma.nft.findMany({
+          where: {
+            watching: true,
+          },
+          select: {
+            chainId: true,
+            contractAddress: true,
+            type: true,
+          },
+        });
+
+        // Restart watching for each contract
+        if (watchingNfts.length > 0) {
+          log.info(`Found ${watchingNfts.length} contracts to resume watching`);
+
+          for (const nft of watchingNfts) {
+            try {
+              // Convert the NftType to TokenType using our utility function
+              const tokenType = nftTypeToTokenType(nft.type);
+
+              // Restart watching the contract
+              const success = await this.watchContract({
+                chain: nft.chainId,
+                address: nft.contractAddress,
+                type: tokenType,
+              });
+
+              if (success) {
+                log.info(
+                  `Resumed watching ${tokenType} contract at ${nft.contractAddress} on chain ${nft.chainId}`
+                );
+              } else {
+                log.error(
+                  `Failed to resume watching ${tokenType} contract at ${nft.contractAddress} on chain ${nft.chainId}`
+                );
+              }
+            } catch (error) {
+              log.error(
+                `Error processing contract ${nft.contractAddress} on chain ${nft.chainId}: ${error}`
+              );
+            }
+          }
+        } else {
+          log.info("No contracts found with watching = true");
+        }
+      }
+
       log.info("ContractEventWatcherService started successfully");
     } catch (error) {
       log.error("Failed to start ContractEventWatcherService:", error);

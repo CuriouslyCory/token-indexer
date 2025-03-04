@@ -6,9 +6,6 @@ import { EventEmitter } from "events";
 loadEnv();
 
 export function registerDefaultRoutes(app: FastifyInstance) {
-  // Initialize the event emitter
-  app.decorate("workflowEvents", new EventEmitter());
-  // Register enhance workflow route
   app.get("/health", {
     schema: {
       querystring: {
@@ -22,13 +19,11 @@ export function registerDefaultRoutes(app: FastifyInstance) {
     handler: async (request, reply) => {
       const { documentId } = request.query as { documentId: number };
 
-      // Immediately return a response indicating the workflow has started
       return {
         status: "processing",
         message:
           "Document enhancement has started. You will be notified when it's complete.",
         documentId,
-        workflow: "enhance",
       };
     },
   });

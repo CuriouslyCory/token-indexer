@@ -13,7 +13,7 @@ loadEnv();
 
 // Schema for the watch contract request
 const WatchContractRequestSchema = z.object({
-  chain: z.string().min(1, "Chain name is required"),
+  chain: z.coerce.number(),
   type: z.nativeEnum(TokenType, {
     errorMap: () => ({
       message: "Type must be one of: ERC20, ERC721, ERC1155",
@@ -26,20 +26,17 @@ const WatchContractRequestSchema = z.object({
 
 // Schema for the stop watching request
 const StopWatchingRequestSchema = z.object({
-  chain: z.string().min(1, "Chain name is required"),
+  chain: z.coerce.number(),
   address: z
     .string()
     .regex(/^0x[a-fA-F0-9]{40}$/, "Invalid Ethereum address format"),
 });
 
 export function registerNftRoutes(app: FastifyInstance) {
-  // Initialize the event emitter
-  app.decorate("workflowEvents", new EventEmitter());
-
   // Endpoint to watch a contract
-  app.post("/nft/watch", {
+  app.get("/nft/watch", {
     schema: {
-      body: {
+      querystring: {
         type: "object",
         required: ["chain", "type", "address"],
         properties: {
@@ -68,7 +65,7 @@ export function registerNftRoutes(app: FastifyInstance) {
     handler: async (request, reply) => {
       try {
         // Validate request body
-        const params = WatchContractRequestSchema.parse(request.body);
+        const params = WatchContractRequestSchema.parse(request.query);
 
         // Get the contract event watcher service
         const contractEventWatcherService =
@@ -115,9 +112,9 @@ export function registerNftRoutes(app: FastifyInstance) {
   });
 
   // Endpoint to stop watching a contract
-  app.post("/nft/unwatch", {
+  app.get("/nft/unwatch", {
     schema: {
-      body: {
+      querystring: {
         type: "object",
         required: ["chain", "address"],
         properties: {
@@ -144,8 +141,8 @@ export function registerNftRoutes(app: FastifyInstance) {
     },
     handler: async (request, reply) => {
       try {
-        // Validate request body
-        const params = StopWatchingRequestSchema.parse(request.body);
+        // Validate request query
+        const params = StopWatchingRequestSchema.parse(request.query);
 
         // Get the contract event watcher service
         const contractEventWatcherService =
@@ -187,31 +184,6 @@ export function registerNftRoutes(app: FastifyInstance) {
           error: "Internal server error",
         };
       }
-    },
-  });
-
-  // Keep the existing user endpoint
-  app.get("/user", {
-    schema: {
-      querystring: {
-        type: "object",
-        properties: {
-          documentId: { type: "number" },
-        },
-        required: ["documentId"],
-      },
-    },
-    handler: async (request, reply) => {
-      const { documentId } = request.query as { documentId: number };
-
-      // Immediately return a response indicating the workflow has started
-      return {
-        status: "processing",
-        message:
-          "Document enhancement has started. You will be notified when it's complete.",
-        documentId,
-        workflow: "enhance",
-      };
     },
   });
 }
