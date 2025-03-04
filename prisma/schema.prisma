@@ -69,14 +69,19 @@ model NftToken {
 
 // Model for tracking revalidation runs
 model RevalidationRun {
-  id                   Int      @id @default(autoincrement())
+  id                   Int       @id @default(autoincrement())
   chainId              Int
   contractAddress      String
   lastTokenIdProcessed String? // The last token ID that was processed in this run
   status               String // Status of the revalidation run (e.g., "in_progress", "completed", "failed")
-  tokensProcessed      Int      @default(0) // Number of tokens processed in this run
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  tokensProcessed      Int       @default(0) // Number of tokens processed in this run
+  successCount         Int       @default(0) // Number of successful token validations
+  failureCount         Int       @default(0) // Number of failed token validations
+  startTime            DateTime  @default(now()) // When the revalidation started
+  endTime              DateTime? // When the revalidation completed or failed
+  processingRate       Float? // Tokens processed per second
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   // Index for faster queries
   @@index([chainId, contractAddress])

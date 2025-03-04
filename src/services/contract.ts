@@ -14,6 +14,7 @@ import {
 import { SUPPORTED_CHAINS } from "~/constants";
 import { erc721Abi } from "~/constants/abi/erc721";
 import { erc1155Abi } from "~/constants/abi/erc1155";
+import Bottleneck from "bottleneck";
 
 // Define the metadata interface
 export interface ContractMetadata {
@@ -28,8 +29,27 @@ export interface ContractMetadata {
 export class ContractService {
   private static instance: ContractService;
   private app?: FastifyInstance;
+  private limiter: Bottleneck;
 
-  private constructor() {}
+  private constructor() {
+    // Initialize the rate limiter with 200 requests per second
+    this.limiter = new Bottleneck({
+      maxConcurrent: 30, // Allow 50 concurrent requests
+    });
+
+    // Add events for monitoring
+    this.limiter.on("error", (error) => {
+      log.error("Bottleneck error:", error);
+    });
+
+    this.limiter.on("failed", (error, jobInfo) => {
+      log.warn(`Bottleneck job failed (attempt ${jobInfo.retryCount}):`, error);
+      // Retry the job if it's a network error, up to 3 times
+      if (jobInfo.retryCount < 3 && error.message.includes("network")) {
+        return 1000 * Math.pow(2, jobInfo.retryCount); // Exponential backoff
+      }
+    });
+  }
 
   public setApp(app: FastifyInstance) {
     this.app = app;
@@ -246,6 +266,7 @@ export class ContractService {
     );
 
     let success = false;
+    const startTime = new Date();
 
     log.info(`Created revalidation run with ID ${revalidationRun.id}`);
 
@@ -276,22 +297,59 @@ export class ContractService {
         success = false;
       }
 
-      // Update the revalidation run record with the final status
-      await this.app.prisma.revalidationRun.update({
+      // Get the latest revalidation run data to calculate metrics
+      const updatedRun = await this.app.prisma.revalidationRun.findUnique({
         where: { id: revalidationRun.id },
-        data: {
-          status: success ? "completed" : "failed",
-          updatedAt: new Date(),
-        },
       });
+
+      if (updatedRun) {
+        const endTime = new Date();
+        const durationSeconds =
+          (endTime.getTime() - startTime.getTime()) / 1000;
+        const processingRate =
+          durationSeconds > 0
+            ? updatedRun.tokensProcessed / durationSeconds
+            : 0;
+
+        // Update the revalidation run record with the final status and metrics
+        await this.app.prisma.revalidationRun.update({
+          where: { id: revalidationRun.id },
+          data: {
+            status: success ? "completed" : "failed",
+            endTime,
+            processingRate,
+            updatedAt: new Date(),
+          },
+        });
+
+        log.info(
+          `Revalidation completed with rate of ${processingRate.toFixed(2)} tokens/second`
+        );
+      }
 
       return success;
     } catch (error) {
+      // Calculate metrics even in case of error
+      const endTime = new Date();
+      const durationSeconds = (endTime.getTime() - startTime.getTime()) / 1000;
+
+      // Get the latest data
+      const updatedRun = await this.app.prisma.revalidationRun.findUnique({
+        where: { id: revalidationRun.id },
+      });
+
+      const processingRate =
+        updatedRun && durationSeconds > 0
+          ? updatedRun.tokensProcessed / durationSeconds
+          : 0;
+
       // Update the revalidation run record with error status
       await this.app.prisma.revalidationRun.update({
         where: { id: revalidationRun.id },
         data: {
           status: "failed",
+          endTime,
+          processingRate,
           updatedAt: new Date(),
         },
       });
@@ -328,48 +386,69 @@ export class ContractService {
         client,
       });
 
-      // Process tokens in batches of 10
-      const batchSize = 10;
+      // Process tokens in larger batches for better throughput
+      const batchSize = 30;
       let successCount = 0;
       let failureCount = 0;
 
       for (let i = startTokenId; i < supply; i += batchSize) {
+        // Create a batch of token IDs to process
+        const tokenIds = [];
+        for (let j = 0; j < batchSize && i + j < supply; j++) {
+          tokenIds.push(i + j);
+        }
+
+        // Process the batch in parallel with rate limiting
+        const results = await Promise.allSettled(
+          tokenIds.map((tokenId) =>
+            this.limiter.schedule(() =>
+              this.processOwnerOf(
+                contract,
+                chainId,
+                contractAddress,
+                tokenId,
+                revalidationRunId
+              )
+            )
+          )
+        );
+
+        // Count successes and failures
         let batchSuccess = false;
+        let batchSuccessCount = 0;
+        let batchFailureCount = 0;
 
-        for (
-          let tokenId = i;
-          tokenId < i + batchSize && tokenId < supply;
-          tokenId++
-        ) {
-          try {
-            // Call ownerOf for each token
-            const owner = await contract.read.ownerOf([BigInt(tokenId)]);
-
-            // If the owner has changed, update the database
-            await this.updateTokenOwner(
-              chainId,
-              contractAddress,
-              tokenId.toString(),
-              owner.toLowerCase() as Address
-            );
-
-            batchSuccess = true;
-            successCount++;
-
-            // Update the revalidation run with the last processed token ID
-            await this.app?.prisma.revalidationRun.update({
-              where: { id: revalidationRunId },
-              data: {
-                lastTokenIdProcessed: tokenId.toString(),
-                tokensProcessed: successCount,
-                updatedAt: new Date(),
-              },
-            });
-          } catch (error) {
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            if (result.value) {
+              batchSuccess = true;
+              successCount++;
+              batchSuccessCount++;
+            } else {
+              failureCount++;
+              batchFailureCount++;
+            }
+          } else {
             failureCount++;
-            log.warn(`Failed to check ownerOf for token ${tokenId}: ${error}`);
+            batchFailureCount++;
+            log.warn(`Failed to process token: ${result.reason}`);
           }
         }
+
+        // Update the revalidation run with the last processed token ID and counts
+        await this.app?.prisma.revalidationRun.update({
+          where: { id: revalidationRunId },
+          data: {
+            lastTokenIdProcessed: (i + batchSize - 1 < supply
+              ? i + batchSize - 1
+              : supply - 1
+            ).toString(),
+            tokensProcessed: successCount + failureCount,
+            successCount,
+            failureCount,
+            updatedAt: new Date(),
+          },
+        });
 
         // If the first batch completely fails, consider it a failure
         if (i === startTokenId && !batchSuccess) {
@@ -386,6 +465,13 @@ export class ContractService {
           );
           break;
         }
+
+        // Log progress every 5 batches
+        if ((i - startTokenId) % (batchSize * 5) === 0) {
+          log.info(
+            `Revalidation progress: ${successCount} tokens processed successfully, ${failureCount} failures`
+          );
+        }
       }
 
       log.info(
@@ -394,6 +480,35 @@ export class ContractService {
       return successCount > 0;
     } catch (error) {
       log.error(`Error in revalidateWithOwnerOf: ${error}`);
+      return false;
+    }
+  }
+
+  /**
+   * Process a single token using ownerOf
+   */
+  private async processOwnerOf(
+    contract: any,
+    chainId: number,
+    contractAddress: Address,
+    tokenId: number,
+    revalidationRunId: number
+  ): Promise<boolean> {
+    try {
+      // Call ownerOf for the token
+      const owner = await contract.read.ownerOf([BigInt(tokenId)]);
+
+      // Update the database with the owner
+      await this.updateTokenOwner(
+        chainId,
+        contractAddress,
+        tokenId.toString(),
+        owner.toLowerCase() as Address
+      );
+
+      return true;
+    } catch (error) {
+      log.warn(`Failed to check ownerOf for token ${tokenId}: ${error}`);
       return false;
     }
   }
@@ -425,65 +540,69 @@ export class ContractService {
         client,
       });
 
-      // Process owners in batches of 10
-      const batchSize = 10;
+      // Process tokens in larger batches for better throughput
+      const batchSize = 50;
       let successCount = 0;
       let failureCount = 0;
 
       for (let i = startTokenId; i < supply; i += batchSize) {
+        // Create a batch of token IDs to process
+        const tokenIds = [];
+        for (let j = 0; j < batchSize && i + j < supply; j++) {
+          tokenIds.push(i + j);
+        }
+
+        // Process the batch in parallel with rate limiting
+        const results = await Promise.allSettled(
+          tokenIds.map((tokenId) =>
+            this.limiter.schedule(() =>
+              this.processTokenByIndex(
+                contract,
+                chainId,
+                contractAddress,
+                tokenId,
+                revalidationRunId
+              )
+            )
+          )
+        );
+
+        // Count successes and failures
         let batchSuccess = false;
+        let batchSuccessCount = 0;
+        let batchFailureCount = 0;
 
-        for (
-          let tokenId = i;
-          tokenId < i + batchSize && tokenId < supply;
-          tokenId++
-        ) {
-          try {
-            // Try to get the first token for this owner
-            const owner = await contract.read.ownerOf([BigInt(tokenId)]);
-
-            // If we got a token, the owner is valid
-            batchSuccess = true;
-            successCount++;
-
-            // Check if this token is in our database
-            const token = await this.app?.prisma.nftToken.findUnique({
-              where: {
-                chainId_contractAddress_tokenId: {
-                  chainId,
-                  contractAddress,
-                  tokenId: tokenId.toString(),
-                },
-              },
-            });
-            if (!token) {
-              // This is a new token, add it to the database
-              await this.app?.prisma.nftToken.create({
-                data: {
-                  chainId,
-                  contractAddress,
-                  tokenId: tokenId.toString(),
-                  ownerAddress: owner as Address,
-                },
-              });
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            if (result.value) {
+              batchSuccess = true;
+              successCount++;
+              batchSuccessCount++;
+            } else {
+              failureCount++;
+              batchFailureCount++;
             }
-
-            // Update the revalidation run with the last processed token ID
-            await this.app?.prisma.revalidationRun.update({
-              where: { id: revalidationRunId },
-              data: {
-                lastTokenIdProcessed: tokenId.toString(),
-                tokensProcessed: successCount,
-                updatedAt: new Date(),
-              },
-            });
-          } catch (error) {
+          } else {
             failureCount++;
-            log.warn(
-              `Failed to check tokenOfOwnerByIndex for token ${tokenId}: ${error}`
-            );
+            batchFailureCount++;
+            log.warn(`Failed to process token: ${result.reason}`);
           }
         }
+
+        // Update the revalidation run with the last processed token ID and counts
+        await this.app?.prisma.revalidationRun.update({
+          where: { id: revalidationRunId },
+          data: {
+            lastTokenIdProcessed: (i + batchSize - 1 < supply
+              ? i + batchSize - 1
+              : supply - 1
+            ).toString(),
+            tokensProcessed: successCount + failureCount,
+            successCount,
+            failureCount,
+            updatedAt: new Date(),
+          },
+        });
 
         // If the first batch completely fails, consider it a failure
         if (i === startTokenId && !batchSuccess) {
@@ -500,6 +619,13 @@ export class ContractService {
           );
           break;
         }
+
+        // Log progress every 5 batches
+        if ((i - startTokenId) % (batchSize * 5) === 0) {
+          log.info(
+            `Revalidation progress: ${successCount} tokens processed successfully, ${failureCount} failures`
+          );
+        }
       }
 
       log.info(
@@ -508,6 +634,67 @@ export class ContractService {
       return successCount > 0;
     } catch (error) {
       log.error(`Error in revalidateWithTokenOfOwnerByIndex: ${error}`);
+      return false;
+    }
+  }
+
+  /**
+   * Process a single token using tokenByIndex
+   */
+  private async processTokenByIndex(
+    contract: any,
+    chainId: number,
+    contractAddress: Address,
+    tokenId: number,
+    revalidationRunId: number
+  ): Promise<boolean> {
+    try {
+      // Try to get the owner for this token
+      const owner = await contract.read.ownerOf([BigInt(tokenId)]);
+
+      // Check if this token is in our database
+      const token = await this.app?.prisma.nftToken.findUnique({
+        where: {
+          chainId_contractAddress_tokenId: {
+            chainId,
+            contractAddress,
+            tokenId: tokenId.toString(),
+          },
+        },
+      });
+
+      if (!token) {
+        // This is a new token, add it to the database
+        await this.app?.prisma.nftToken.create({
+          data: {
+            chainId,
+            contractAddress,
+            tokenId: tokenId.toString(),
+            ownerAddress: owner as Address,
+          },
+        });
+      } else if (token.ownerAddress !== owner.toLowerCase()) {
+        // Update the owner if it has changed
+        await this.app?.prisma.nftToken.update({
+          where: {
+            chainId_contractAddress_tokenId: {
+              chainId,
+              contractAddress,
+              tokenId: tokenId.toString(),
+            },
+          },
+          data: {
+            ownerAddress: owner.toLowerCase() as Address,
+            updatedAt: new Date(),
+          },
+        });
+      }
+
+      return true;
+    } catch (error) {
+      log.warn(
+        `Failed to check tokenOfOwnerByIndex for token ${tokenId}: ${error}`
+      );
       return false;
     }
   }
