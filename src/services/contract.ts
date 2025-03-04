@@ -160,6 +160,46 @@ export class ContractService {
     }
   }
 
+  private async getRevalidationRun(
+    chainId: number,
+    contractAddress: Address,
+    startTokenId = "0"
+  ) {
+    // Check if there's already an in-progress revalidation
+    const existingRun = await this.app?.prisma.revalidationRun.findFirst({
+      where: {
+        chainId,
+        contractAddress,
+        status: "in_progress",
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    if (existingRun) {
+      return existingRun;
+    }
+
+    // create new revalidation run
+    const newRun = await this.app?.prisma.revalidationRun.create({
+      data: {
+        chainId,
+        contractAddress,
+        status: "in_progress",
+        lastTokenIdProcessed: startTokenId,
+      },
+    });
+
+    if (!newRun) {
+      throw new Error(
+        `Failed to create revalidation run for ${contractAddress} on chain ${chainId}`
+      );
+    }
+
+    return newRun;
+  }
+
   /**
    * Revalidate token ownership for a contract
    * This function will try different methods to check token ownership
@@ -167,19 +207,15 @@ export class ContractService {
   public async revalidate(
     chainId: number,
     contractAddress: Address,
-    tokenType: TokenType
+    tokenType: TokenType,
+    startTokenId?: string
   ): Promise<boolean> {
     if (!this.app?.prisma) {
       log.error("Prisma client not available");
       return false;
     }
 
-    log.info(
-      `Revalidating tokens for contract ${contractAddress} on chain ${chainId}`
-    );
-
-    let success = false;
-
+    // Get the contract from the database
     const contract = await this.app.prisma.nft.findUnique({
       where: {
         chainId_contractAddress: {
@@ -196,29 +232,73 @@ export class ContractService {
       return false;
     }
 
-    // Try different methods based on token type
-    if (tokenType === TokenType.ERC721) {
-      // Try ownerOf method first
-      success = await this.revalidateWithOwnerOf(
-        chainId,
-        contractAddress,
-        parseInt(contract.supply ?? "0")
-      );
+    // Get the revalidation run (new or existing)
+    const revalidationRun = await this.getRevalidationRun(
+      chainId,
+      contractAddress,
+      startTokenId
+    );
 
-      // If ownerOf failed, try tokenOfOwnerByIndex
-      if (!success) {
-        success = await this.revalidateWithTokenByIndex(
+    log.info(
+      `Revalidating tokens for contract ${contractAddress} on chain ${chainId}${
+        startTokenId ? ` starting from token ID ${startTokenId}` : ""
+      }`
+    );
+
+    let success = false;
+
+    log.info(`Created revalidation run with ID ${revalidationRun.id}`);
+
+    try {
+      // Try different methods based on token type
+      if (tokenType === TokenType.ERC721) {
+        // Try ownerOf method first
+        success = await this.revalidateWithOwnerOf(
           chainId,
           contractAddress,
-          parseInt(contract.supply ?? "0")
+          parseInt(contract.supply ?? "0"),
+          revalidationRun.id,
+          startTokenId ? parseInt(startTokenId) : 0
         );
-      }
-    } else if (tokenType === TokenType.ERC1155) {
-      // erc1155 doesn't have a way to check token ownership without addresses
-      success = false;
-    }
 
-    return success;
+        // If ownerOf failed, try tokenOfOwnerByIndex
+        if (!success) {
+          success = await this.revalidateWithTokenByIndex(
+            chainId,
+            contractAddress,
+            parseInt(contract.supply ?? "0"),
+            revalidationRun.id,
+            startTokenId ? parseInt(startTokenId) : 0
+          );
+        }
+      } else if (tokenType === TokenType.ERC1155) {
+        // erc1155 doesn't have a way to check token ownership without addresses
+        success = false;
+      }
+
+      // Update the revalidation run record with the final status
+      await this.app.prisma.revalidationRun.update({
+        where: { id: revalidationRun.id },
+        data: {
+          status: success ? "completed" : "failed",
+          updatedAt: new Date(),
+        },
+      });
+
+      return success;
+    } catch (error) {
+      // Update the revalidation run record with error status
+      await this.app.prisma.revalidationRun.update({
+        where: { id: revalidationRun.id },
+        data: {
+          status: "failed",
+          updatedAt: new Date(),
+        },
+      });
+
+      log.error(`Error during revalidation: ${error}`);
+      return false;
+    }
   }
 
   /**
@@ -227,10 +307,14 @@ export class ContractService {
   private async revalidateWithOwnerOf(
     chainId: number,
     contractAddress: Address,
-    supply: number
+    supply: number,
+    revalidationRunId: number,
+    startTokenId: number = 0
   ): Promise<boolean> {
     try {
-      log.info(`Revalidating with ownerOf for ${contractAddress}`);
+      log.info(
+        `Revalidating with ownerOf for ${contractAddress} starting from token ID ${startTokenId}`
+      );
 
       const client = this.getChainClient(chainId);
       if (!client) {
@@ -249,16 +333,19 @@ export class ContractService {
       let successCount = 0;
       let failureCount = 0;
 
-      for (let i = 0; i < supply; i += batchSize) {
+      for (let i = startTokenId; i < supply; i += batchSize) {
         let batchSuccess = false;
 
-        for (let tokenId = i; tokenId < i + batchSize; tokenId++) {
+        for (
+          let tokenId = i;
+          tokenId < i + batchSize && tokenId < supply;
+          tokenId++
+        ) {
           try {
             // Call ownerOf for each token
             const owner = await contract.read.ownerOf([BigInt(tokenId)]);
 
             // If the owner has changed, update the database
-
             await this.updateTokenOwner(
               chainId,
               contractAddress,
@@ -268,6 +355,16 @@ export class ContractService {
 
             batchSuccess = true;
             successCount++;
+
+            // Update the revalidation run with the last processed token ID
+            await this.app?.prisma.revalidationRun.update({
+              where: { id: revalidationRunId },
+              data: {
+                lastTokenIdProcessed: tokenId.toString(),
+                tokensProcessed: successCount,
+                updatedAt: new Date(),
+              },
+            });
           } catch (error) {
             failureCount++;
             log.warn(`Failed to check ownerOf for token ${tokenId}: ${error}`);
@@ -275,7 +372,7 @@ export class ContractService {
         }
 
         // If the first batch completely fails, consider it a failure
-        if (i === 0 && !batchSuccess) {
+        if (i === startTokenId && !batchSuccess) {
           log.error(
             `First batch of ownerOf checks failed for ${contractAddress}`
           );
@@ -285,7 +382,7 @@ export class ContractService {
         // If a batch completely fails, consider the method exhausted
         if (!batchSuccess) {
           log.info(
-            `Batch ${i / batchSize} failed completely, stopping ownerOf checks`
+            `Batch ${(i - startTokenId) / batchSize} failed completely, stopping ownerOf checks`
           );
           break;
         }
@@ -307,10 +404,14 @@ export class ContractService {
   private async revalidateWithTokenByIndex(
     chainId: number,
     contractAddress: Address,
-    supply: number
+    supply: number,
+    revalidationRunId: number,
+    startTokenId: number = 0
   ): Promise<boolean> {
     try {
-      log.info(`Revalidating with tokenOfOwnerByIndex for ${contractAddress}`);
+      log.info(
+        `Revalidating with tokenOfOwnerByIndex for ${contractAddress} starting from token ID ${startTokenId}`
+      );
 
       const client = this.getChainClient(chainId);
       if (!client) {
@@ -329,10 +430,14 @@ export class ContractService {
       let successCount = 0;
       let failureCount = 0;
 
-      for (let i = 0; i < supply; i += batchSize) {
+      for (let i = startTokenId; i < supply; i += batchSize) {
         let batchSuccess = false;
 
-        for (let tokenId = i; tokenId < i + batchSize; tokenId++) {
+        for (
+          let tokenId = i;
+          tokenId < i + batchSize && tokenId < supply;
+          tokenId++
+        ) {
           try {
             // Try to get the first token for this owner
             const owner = await contract.read.ownerOf([BigInt(tokenId)]);
@@ -362,6 +467,16 @@ export class ContractService {
                 },
               });
             }
+
+            // Update the revalidation run with the last processed token ID
+            await this.app?.prisma.revalidationRun.update({
+              where: { id: revalidationRunId },
+              data: {
+                lastTokenIdProcessed: tokenId.toString(),
+                tokensProcessed: successCount,
+                updatedAt: new Date(),
+              },
+            });
           } catch (error) {
             failureCount++;
             log.warn(
@@ -371,7 +486,7 @@ export class ContractService {
         }
 
         // If the first batch completely fails, consider it a failure
-        if (i === 0 && !batchSuccess) {
+        if (i === startTokenId && !batchSuccess) {
           log.error(
             `First batch of tokenOfOwnerByIndex checks failed for ${contractAddress}`
           );
@@ -381,7 +496,7 @@ export class ContractService {
         // If a batch completely fails, consider the method exhausted
         if (!batchSuccess) {
           log.info(
-            `Batch ${i / batchSize} failed completely, stopping tokenOfOwnerByIndex checks`
+            `Batch ${(i - startTokenId) / batchSize} failed completely, stopping tokenOfOwnerByIndex checks`
           );
           break;
         }

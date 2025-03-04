@@ -14,6 +14,7 @@ import {
 import { SUPPORTED_CHAINS } from "~/constants";
 import SuperJSON from "superjson";
 import { ContractService } from "./contract";
+import { getWssClient } from "~/utils/web3";
 
 loadEnv();
 
@@ -93,10 +94,7 @@ export class ContractEventWatcherService {
       return null;
     }
 
-    const client = createPublicClient({
-      chain,
-      transport: http(),
-    });
+    const client = getWssClient(chainId);
 
     // Initialize the chain watcher structure
     if (!this.chainEventWatchers[chainId]) {

@@ -35,6 +35,23 @@ const StopWatchingRequestSchema = z.object({
     .regex(/^0x[a-fA-F0-9]{40}$/, "Invalid Ethereum address format"),
 });
 
+// Schema for the revalidate request
+const RevalidateRequestSchema = z.object({
+  chain: z.coerce.number(),
+  address: z
+    .string()
+    .regex(/^0x[a-fA-F0-9]{40}$/, "Invalid Ethereum address format"),
+  startTokenId: z.string().optional(), // Optional starting token ID for resuming revalidation
+});
+
+// Schema for the revalidation status request
+const RevalidationStatusRequestSchema = z.object({
+  chain: z.coerce.number(),
+  address: z
+    .string()
+    .regex(/^0x[a-fA-F0-9]{40}$/, "Invalid Ethereum address format"),
+});
+
 export function registerNftRoutes(app: FastifyInstance) {
   // Endpoint to watch a contract
   app.get("/nft/watch", {
@@ -198,6 +215,7 @@ export function registerNftRoutes(app: FastifyInstance) {
         properties: {
           chain: { type: "string" },
           address: { type: "string" },
+          startTokenId: { type: "string" },
         },
       },
       response: {
@@ -206,6 +224,7 @@ export function registerNftRoutes(app: FastifyInstance) {
           properties: {
             success: { type: "boolean" },
             message: { type: "string" },
+            revalidationRunId: { type: "number" },
           },
         },
         400: {
@@ -220,7 +239,7 @@ export function registerNftRoutes(app: FastifyInstance) {
     handler: async (request, reply) => {
       try {
         // Validate request query
-        const params = ContractRequestSchema.parse(request.query);
+        const params = RevalidateRequestSchema.parse(request.query);
 
         // Find the NFT in the database
         const nft = await request.server.prisma.nft.findUnique({
@@ -249,19 +268,34 @@ export function registerNftRoutes(app: FastifyInstance) {
           const success = await contractService.revalidate(
             nft.chainId,
             nft.contractAddress as Address,
-            tokenType
+            tokenType,
+            params.startTokenId
           );
+
+          // Get the latest revalidation run
+          const latestRun =
+            await request.server.prisma.revalidationRun.findFirst({
+              where: {
+                chainId: params.chain,
+                contractAddress: params.address,
+              },
+              orderBy: {
+                createdAt: "desc",
+              },
+            });
 
           if (success) {
             return {
               success: true,
               message: `Successfully revalidated tokens for ${nft.contractAddress} on chain ${nft.chainId}`,
+              revalidationRunId: latestRun?.id ?? 0,
             };
           } else {
             reply.code(400);
             return {
               success: false,
               error: `Failed to revalidate tokens for ${nft.contractAddress} on chain ${nft.chainId}`,
+              revalidationRunId: latestRun?.id ?? 0,
             };
           }
         } catch (revalidateError) {
@@ -276,6 +310,97 @@ export function registerNftRoutes(app: FastifyInstance) {
         }
       } catch (error) {
         log.error("Error in revalidate endpoint:", error);
+
+        // Handle validation errors
+        if (error instanceof z.ZodError) {
+          reply.code(400);
+          return {
+            success: false,
+            error: error.errors.map((e) => e.message).join(", "),
+          };
+        }
+
+        reply.code(500);
+        return {
+          success: false,
+          error: "Internal server error",
+        };
+      }
+    },
+  });
+
+  // Endpoint to get revalidation status
+  app.get("/nft/revalidation-status", {
+    schema: {
+      querystring: {
+        type: "object",
+        required: ["chain", "address"],
+        properties: {
+          chain: { type: "string" },
+          address: { type: "string" },
+        },
+      },
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            success: { type: "boolean" },
+            revalidationRuns: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "number" },
+                  status: { type: "string" },
+                  lastTokenIdProcessed: { type: "string" },
+                  tokensProcessed: { type: "number" },
+                  createdAt: { type: "string" },
+                  updatedAt: { type: "string" },
+                },
+              },
+            },
+          },
+        },
+        400: {
+          type: "object",
+          properties: {
+            success: { type: "boolean" },
+            error: { type: "string" },
+          },
+        },
+      },
+    },
+    handler: async (request, reply) => {
+      try {
+        // Validate request query
+        const params = RevalidationStatusRequestSchema.parse(request.query);
+
+        // Find revalidation runs for this contract
+        const revalidationRuns =
+          await request.server.prisma.revalidationRun.findMany({
+            where: {
+              chainId: params.chain,
+              contractAddress: params.address,
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+            take: 10, // Limit to the 10 most recent runs
+          });
+
+        return {
+          success: true,
+          revalidationRuns: revalidationRuns.map((run) => ({
+            id: run.id,
+            status: run.status,
+            lastTokenIdProcessed: run.lastTokenIdProcessed ?? "0",
+            tokensProcessed: run.tokensProcessed,
+            createdAt: run.createdAt.toISOString(),
+            updatedAt: run.updatedAt.toISOString(),
+          })),
+        };
+      } catch (error) {
+        log.error("Error in revalidation status endpoint:", error);
 
         // Handle validation errors
         if (error instanceof z.ZodError) {

@@ -66,3 +66,20 @@ model NftToken {
   @@index([chainId, contractAddress])
   @@index([ownerAddress])
 }
+
+// Model for tracking revalidation runs
+model RevalidationRun {
+  id                   Int      @id @default(autoincrement())
+  chainId              Int
+  contractAddress      String
+  lastTokenIdProcessed String? // The last token ID that was processed in this run
+  status               String // Status of the revalidation run (e.g., "in_progress", "completed", "failed")
+  tokensProcessed      Int      @default(0) // Number of tokens processed in this run
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  // Index for faster queries
+  @@index([chainId, contractAddress])
+  @@index([status])
+  @@index([createdAt])
+}
