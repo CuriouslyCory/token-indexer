@@ -1,10 +1,8 @@
 import { FastifyInstance } from "fastify";
 import log from "electron-log";
-import { loadEnv, nftTypeToTokenType, tokenTypeToNftType } from "~/utils";
+import { loadEnv, nftTypeToTokenType } from "~/utils";
 import { z } from "zod";
 import {
-  createPublicClient,
-  http,
   type PublicClient,
   type Log,
   type Address,
