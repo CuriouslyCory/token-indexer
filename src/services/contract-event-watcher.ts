@@ -5,26 +5,15 @@ import { z } from "zod";
 import {
   createPublicClient,
   http,
-  type Chain,
   type PublicClient,
   type Log,
   type Address,
   parseAbiItem,
   type WatchEventReturnType,
 } from "viem";
-import {
-  mainnet,
-  sepolia,
-  base,
-  optimism,
-  arbitrum,
-  polygon,
-} from "viem/chains";
-import { erc721Abi } from "~/constants/abi/erc721";
-import { erc20Abi } from "~/constants/abi/erc20";
-import { erc1155Abi } from "~/constants/abi/erc1155";
+import { SUPPORTED_CHAINS } from "~/constants";
 import SuperJSON from "superjson";
-import { NftType } from "@prisma/client";
+import { ContractService } from "./contract";
 
 loadEnv();
 
@@ -70,16 +59,6 @@ export class ContractEventWatcherService {
   private app?: FastifyInstance;
   private chainEventWatchers: ChainEventWatchers = {};
 
-  // Map of supported chains
-  private readonly chains: Record<number, Chain> = {
-    1: mainnet,
-    11155111: sepolia,
-    8453: base,
-    10: optimism,
-    42161: arbitrum,
-    137: polygon,
-  };
-
   private constructor() {}
 
   public setApp(app: FastifyInstance) {
@@ -108,7 +87,7 @@ export class ContractEventWatcherService {
     }
 
     // Otherwise, create a new client
-    const chain = this.chains[chainId];
+    const chain = SUPPORTED_CHAINS[chainId];
     if (!chain) {
       log.error(`Unsupported chain: ${chainId}`);
       return null;
@@ -157,7 +136,12 @@ export class ContractEventWatcherService {
             "erc721Transfer",
             address
           );
-          await this.upsertNft(chainId, address, TokenType.ERC721);
+          // Use the ContractService to upsert the NFT
+          await ContractService.getInstance().upsertNft(
+            chainId,
+            address,
+            TokenType.ERC721
+          );
           break;
 
         case TokenType.ERC20:
@@ -180,7 +164,12 @@ export class ContractEventWatcherService {
             address
           );
           await this.addContractToEventWatcher(chainId, "erc1155URI", address);
-          await this.upsertNft(chainId, address, TokenType.ERC1155);
+          // Use the ContractService to upsert the NFT
+          await ContractService.getInstance().upsertNft(
+            chainId,
+            address,
+            TokenType.ERC1155
+          );
           break;
 
         default:
@@ -195,43 +184,6 @@ export class ContractEventWatcherService {
     } catch (error) {
       log.error("Error setting up contract watch:", error);
       return false;
-    }
-  }
-
-  private async upsertNft(
-    chainId: number,
-    address: Address,
-    tokenType: TokenType
-  ): Promise<void> {
-    // Upsert the NFT record in the database
-    if (this.app?.prisma) {
-      try {
-        // For simplicity, we'll just use a default name and not try to read from the contract
-        // This avoids the complex type issues with the ABI
-        await this.app.prisma.nft.upsert({
-          where: {
-            chainId_contractAddress: {
-              chainId,
-              contractAddress: address,
-            },
-          },
-          update: {
-            watching: true,
-          },
-          create: {
-            chainId,
-            contractAddress: address,
-            name: `ERC721 NFT (${address.slice(0, 6)}...)`,
-            type: tokenTypeToNftType(tokenType)!,
-            watching: true,
-          },
-        });
-        log.info(
-          `Upserted ERC721 NFT record for ${address} on chain ${chainId}`
-        );
-      } catch (error) {
-        log.error(`Error upserting NFT record: ${error}`);
-      }
     }
   }
 

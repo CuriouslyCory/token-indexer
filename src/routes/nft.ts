@@ -8,11 +8,14 @@ import {
   ContractWatchParamsSchema,
 } from "~/services/contract-event-watcher";
 import { z } from "zod";
+import { ContractService } from "~/services";
+import { nftTypeToTokenType } from "~/utils";
+import type { Address } from "viem";
 
 loadEnv();
 
 // Schema for the watch contract request
-const WatchContractRequestSchema = z.object({
+const ContractRequestSchema = z.object({
   chain: z.coerce.number(),
   type: z.nativeEnum(TokenType, {
     errorMap: () => ({
@@ -65,7 +68,7 @@ export function registerNftRoutes(app: FastifyInstance) {
     handler: async (request, reply) => {
       try {
         // Validate request body
-        const params = WatchContractRequestSchema.parse(request.query);
+        const params = ContractRequestSchema.parse(request.query);
 
         // Get the contract event watcher service
         const contractEventWatcherService =
@@ -168,6 +171,112 @@ export function registerNftRoutes(app: FastifyInstance) {
         }
       } catch (error) {
         log.error("Error in stop watching endpoint:", error);
+
+        // Handle validation errors
+        if (error instanceof z.ZodError) {
+          reply.code(400);
+          return {
+            success: false,
+            error: error.errors.map((e) => e.message).join(", "),
+          };
+        }
+
+        reply.code(500);
+        return {
+          success: false,
+          error: "Internal server error",
+        };
+      }
+    },
+  });
+
+  app.get("/nft/revalidate", {
+    schema: {
+      querystring: {
+        type: "object",
+        required: ["chain", "address"],
+        properties: {
+          chain: { type: "string" },
+          address: { type: "string" },
+          tokenId: { type: "string" },
+        },
+      },
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            success: { type: "boolean" },
+            message: { type: "string" },
+          },
+        },
+        400: {
+          type: "object",
+          properties: {
+            success: { type: "boolean" },
+            error: { type: "string" },
+          },
+        },
+      },
+    },
+    handler: async (request, reply) => {
+      try {
+        // Validate request query
+        const params = ContractRequestSchema.parse(request.query);
+
+        // Find the NFT in the database
+        const nft = await request.server.prisma.nft.findUnique({
+          where: {
+            chainId_contractAddress: {
+              chainId: params.chain,
+              contractAddress: params.address,
+            },
+          },
+        });
+
+        if (!nft) {
+          reply.code(404);
+          return {
+            success: false,
+            error: `NFT not found for address ${params.address} on chain ${params.chain}`,
+          };
+        }
+
+        // Convert NftType to TokenType
+        const tokenType = nftTypeToTokenType(nft.type);
+
+        // Revalidate the contract's tokens
+        try {
+          const contractService = ContractService.getInstance();
+          const success = await contractService.revalidate(
+            nft.chainId,
+            nft.contractAddress as Address,
+            tokenType
+          );
+
+          if (success) {
+            return {
+              success: true,
+              message: `Successfully revalidated tokens for ${nft.contractAddress} on chain ${nft.chainId}`,
+            };
+          } else {
+            reply.code(400);
+            return {
+              success: false,
+              error: `Failed to revalidate tokens for ${nft.contractAddress} on chain ${nft.chainId}`,
+            };
+          }
+        } catch (revalidateError) {
+          log.error(
+            `Error revalidating tokens for ${nft.contractAddress} on chain ${nft.chainId}: ${revalidateError}`
+          );
+          reply.code(500);
+          return {
+            success: false,
+            error: "Error during revalidation process",
+          };
+        }
+      } catch (error) {
+        log.error("Error in revalidate endpoint:", error);
 
         // Handle validation errors
         if (error instanceof z.ZodError) {

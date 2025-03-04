@@ -1,1 +1,1 @@
-const foo = "Hello World";
+export const APP_NAME = "Token Indexer";

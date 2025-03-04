@@ -28,11 +28,13 @@ model Nft {
   contractAddress String
   ownerAddress    String?
   supply          String? // Using String to handle large numbers
+  maxSupply       String? // Maximum supply of the NFT collection
   symbol          String?
   name            String
   logoUri         String?
   bannerUri       String?
   description     String?
+  contractURI     String? // URI for contract metadata (EIP-7572)
   type            NftType
   createdAt       DateTime @default(now())
   updatedAt       DateTime @default(now()) @updatedAt
