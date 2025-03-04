@@ -23,7 +23,7 @@ enum NftType {
 
 // New model for NFT collections
 model Nft {
-  id              Int      @id @default(autoincrement())
+  compositeId     String   @id // Format: "${chainId}:${contractAddress}"
   chainId         Int
   contractAddress String
   ownerAddress    String?
@@ -50,7 +50,7 @@ model Nft {
 
 // Model for NFT tokens within a collection (for ERC1155)
 model NftToken {
-  id              Int      @id @default(autoincrement())
+  compositeId     String   @id // Format: "${chainId}:${contractAddress}:${tokenId}"
   chainId         Int
   contractAddress String
   tokenId         String // Using String to handle large token IDs

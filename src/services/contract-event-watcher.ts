@@ -343,22 +343,22 @@ export class ContractEventWatcherService {
           // Use a self-executing async function to handle the database operation
           (async () => {
             try {
+              const tokenIdStr = args.tokenId!.toString();
+              const compositeId = `${chainId}:${logItem.address}:${tokenIdStr}`;
+
               await this.app!.prisma.nftToken.upsert({
                 where: {
-                  chainId_contractAddress_tokenId: {
-                    chainId,
-                    contractAddress: logItem.address,
-                    tokenId: args.tokenId!.toString(),
-                  },
+                  compositeId,
                 },
                 update: {
                   ownerAddress: args.to,
                   updatedAt: new Date(),
                 },
                 create: {
+                  compositeId,
                   chainId,
                   contractAddress: logItem.address,
-                  tokenId: args.tokenId!.toString(),
+                  tokenId: tokenIdStr,
                   ownerAddress: args.to,
                   supply: "1", // ERC721 tokens always have a supply of 1
                 },
@@ -408,13 +408,12 @@ export class ContractEventWatcherService {
           // Use a self-executing async function to handle the database operation
           (async () => {
             try {
+              const tokenIdStr = args.id!.toString();
+              const compositeId = `${chainId}:${logItem.address}:${tokenIdStr}`;
+
               await this.app!.prisma.nftToken.upsert({
                 where: {
-                  chainId_contractAddress_tokenId: {
-                    chainId,
-                    contractAddress: logItem.address,
-                    tokenId: args.id!.toString(),
-                  },
+                  compositeId,
                 },
                 update: {
                   ownerAddress: args.to,
@@ -422,9 +421,10 @@ export class ContractEventWatcherService {
                   updatedAt: new Date(),
                 },
                 create: {
+                  compositeId,
                   chainId,
                   contractAddress: logItem.address,
-                  tokenId: args.id!.toString(),
+                  tokenId: tokenIdStr,
                   ownerAddress: args.to,
                   supply: args.value!.toString(),
                 },
@@ -542,13 +542,11 @@ export class ContractEventWatcherService {
     if (!this.app?.prisma || !ownerAddress) return;
 
     try {
+      const compositeId = `${chainId}:${contractAddress}:${tokenId}`;
+
       await this.app.prisma.nftToken.upsert({
         where: {
-          chainId_contractAddress_tokenId: {
-            chainId,
-            contractAddress,
-            tokenId,
-          },
+          compositeId,
         },
         update: {
           ownerAddress,
@@ -556,6 +554,7 @@ export class ContractEventWatcherService {
           updatedAt: new Date(),
         },
         create: {
+          compositeId,
           chainId,
           contractAddress,
           tokenId,

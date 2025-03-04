@@ -242,12 +242,10 @@ export function registerNftRoutes(app: FastifyInstance) {
         const params = RevalidateRequestSchema.parse(request.query);
 
         // Find the NFT in the database
+        const compositeId = `${params.chain}:${params.address}`;
         const nft = await request.server.prisma.nft.findUnique({
           where: {
-            chainId_contractAddress: {
-              chainId: params.chain,
-              contractAddress: params.address,
-            },
+            compositeId,
           },
         });
 

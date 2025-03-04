@@ -5,11 +5,9 @@ import { tokenTypeToNftType } from "~/utils";
 import {
   createPublicClient,
   http,
-  type Chain,
   type PublicClient,
   type Address,
   getContract,
-  ContractFunctionExecutionError,
 } from "viem";
 import { SUPPORTED_CHAINS } from "~/constants";
 import { erc721Abi } from "~/constants/abi/erc721";
@@ -32,9 +30,10 @@ export class ContractService {
   private limiter: Bottleneck;
 
   private constructor() {
-    // Initialize the rate limiter with 200 requests per second
+    // Initialize the rate limiter
     this.limiter = new Bottleneck({
-      maxConcurrent: 30, // Allow 50 concurrent requests
+      maxConcurrent: 20,
+      minTime: 40,
     });
 
     // Add events for monitoring
@@ -100,13 +99,12 @@ export class ContractService {
     }
 
     try {
+      const compositeId = `${chainId}:${address}`;
+
       // Check if the record already exists
       const existingNft = await this.app.prisma.nft.findUnique({
         where: {
-          chainId_contractAddress: {
-            chainId,
-            contractAddress: address,
-          },
+          compositeId,
         },
       });
 
@@ -125,10 +123,7 @@ export class ContractService {
 
         await this.app.prisma.nft.update({
           where: {
-            chainId_contractAddress: {
-              chainId,
-              contractAddress: address,
-            },
+            compositeId,
           },
           data: {
             watching: true,
@@ -159,6 +154,7 @@ export class ContractService {
       // Create a new NFT record
       await this.app.prisma.nft.create({
         data: {
+          compositeId: `${chainId}:${address}`,
           chainId,
           contractAddress: address,
           name: metadata.name ?? `NFT (${address.slice(0, 6)}...)`,
@@ -236,12 +232,10 @@ export class ContractService {
     }
 
     // Get the contract from the database
+    const compositeId = `${chainId}:${contractAddress}`;
     const contract = await this.app.prisma.nft.findUnique({
       where: {
-        chainId_contractAddress: {
-          chainId,
-          contractAddress,
-        },
+        compositeId,
       },
     });
 
@@ -412,7 +406,7 @@ export class ContractService {
             )
           )
         );
-
+        ``;
         // Count successes and failures
         let batchSuccess = false;
         let batchSuccessCount = 0;
@@ -653,13 +647,12 @@ export class ContractService {
       const owner = await contract.read.ownerOf([BigInt(tokenId)]);
 
       // Check if this token is in our database
+      const tokenId_str = tokenId.toString();
+      const compositeId = `${chainId}:${contractAddress}:${tokenId_str}`;
+
       const token = await this.app?.prisma.nftToken.findUnique({
         where: {
-          chainId_contractAddress_tokenId: {
-            chainId,
-            contractAddress,
-            tokenId: tokenId.toString(),
-          },
+          compositeId,
         },
       });
 
@@ -667,9 +660,10 @@ export class ContractService {
         // This is a new token, add it to the database
         await this.app?.prisma.nftToken.create({
           data: {
+            compositeId,
             chainId,
             contractAddress,
-            tokenId: tokenId.toString(),
+            tokenId: tokenId_str,
             ownerAddress: owner as Address,
           },
         });
@@ -677,11 +671,7 @@ export class ContractService {
         // Update the owner if it has changed
         await this.app?.prisma.nftToken.update({
           where: {
-            chainId_contractAddress_tokenId: {
-              chainId,
-              contractAddress,
-              tokenId: tokenId.toString(),
-            },
+            compositeId,
           },
           data: {
             ownerAddress: owner.toLowerCase() as Address,
@@ -711,19 +701,18 @@ export class ContractService {
     if (!this.app?.prisma) return;
 
     try {
+      const compositeId = `${chainId}:${contractAddress}:${tokenId}`;
+
       await this.app.prisma.nftToken.upsert({
         where: {
-          chainId_contractAddress_tokenId: {
-            chainId,
-            contractAddress,
-            tokenId,
-          },
+          compositeId,
         },
         update: {
           ownerAddress: newOwner,
           updatedAt: new Date(),
         },
         create: {
+          compositeId,
           chainId,
           contractAddress,
           tokenId,
@@ -747,13 +736,11 @@ export class ContractService {
     if (!this.app?.prisma) return;
 
     try {
+      const compositeId = `${chainId}:${contractAddress}:${tokenId}`;
+
       await this.app.prisma.nftToken.update({
         where: {
-          chainId_contractAddress_tokenId: {
-            chainId,
-            contractAddress,
-            tokenId,
-          },
+          compositeId,
         },
         data: {
           ownerAddress: null,
@@ -778,8 +765,11 @@ export class ContractService {
     if (!this.app?.prisma) return;
 
     try {
+      const compositeId = `${chainId}:${contractAddress}:${tokenId}`;
+
       await this.app.prisma.nftToken.create({
         data: {
+          compositeId,
           chainId,
           contractAddress,
           tokenId,
